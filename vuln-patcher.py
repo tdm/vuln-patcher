@@ -7,6 +7,12 @@ import getopt
 from xml.etree import ElementTree
 import subprocess
 
+cfg = dict()
+cfg['dry-run'] = False
+cfg['ni'] = False
+
+git_history = dict()
+
 def dequote(s):
     if s.startswith('"') and s.endswith('"'):
         return s[1:-1]
@@ -72,10 +78,22 @@ class Version:
         return True
 
 class Patch:
-    def __init__(self, text):
-        self._text = text
+    def __init__(self, url):
+        self._url = url
+        self._sha = ''
+        self._author = ''
+        self._date = ''
+        self._subject = ''
         self._files = []
-        for line in text.split('\n'):
+
+    def _fetch(self):
+        if len(self._sha) > 0:
+            return
+        rs = requests.Session()
+        r = rs.get(self._url)
+        r.raise_for_status()
+        self._text = r.content
+        for line in self._text.rstrip('\n').split('\n'):
             fields = line.split(' ', 1)
             if len(fields) < 2:
                 continue
@@ -86,72 +104,193 @@ class Patch:
             if fields[0] == 'Date:':
                 self._date = fields[1]
             if fields[0] == 'Subject:':
-                self._subject = fields[1]
+                self._subject = fields[1].strip()
             if fields[0] == 'diff':
                 fields = line.split(' ')
                 self._files.append(fields[2][2:])
 
-    @classmethod
-    def from_url(cls, url):
-        rs = requests.Session()
-        r = rs.get(url)
-        r.raise_for_status()
-        return cls(r.content)
-
-    @classmethod
-    def from_text(cls, text):
-        return cls(text)
+    def url(self):
+        self._fetch()
+        return self._url
 
     def sha(self):
+        self._fetch()
         return self._sha
 
     def subject(self):
+        self._fetch()
         return self._subject
 
     def files(self):
+        self._fetch()
         return self._files
 
     def can_apply(self):
+        self._fetch()
         argv = ['patch', '-p1', '--force', '--dry-run']
         (rc, out, err) = cmd_run(argv, self._text)
         return (rc == 0)
 
     def can_reverse(self):
+        self._fetch()
         argv = ['patch', '-p1', '--force', '--dry-run', '--reverse']
         (rc, out, err) = cmd_run(argv, self._text)
         return (rc == 0)
 
     def apply(self):
+        self._fetch()
         argv = ['patch', '-p1', '--force', '--no-backup-if-mismatch']
         (rc, out, err) = cmd_run(argv, self._text)
         if rc != 0:
             raise RuntimeError("Patch failed to apply")
 
     def reverse(self):
+        self._fetch()
         argv = ['patch', '-p1', '--force', '--reverse']
         (rc, out, err) = cmd_run(argv, self._text)
         if rc != 0:
             raise RuntimeError("Patch failed to reverse")
 
     def in_git_history(self):
-        found = 0
-        for f in self._files:
-            argv = ['git', 'log', '--oneline', f]
-            (rc, out, err) = cmd_run(argv)
-            if rc != 0:
-                continue
-            for line in out:
-                fields = line.split(' ', 1)
-                if fields[1] == self._subject:
-                    found += 1
-                    break
-        return (found == len(self._files))
+        self._fetch()
+        found = False
+        if self._subject in git_history:
+            found = True
+            revert_subject = "Revert: %s" % (self._subject)
+            if revert_subject in git_history:
+                found = False
+        return found
 
     def git_am(self):
+        self._fetch()
         argv = ['git', 'am']
-        (rc, out, err) = cmd_run(argv, patch._text)
+        (rc, out, err) = cmd_run(argv, self._text)
         if rc != 0:
             raise RuntimeError("Patch failed to merge")
+
+
+class Vuln:
+    def __init__(self, url):
+        self._applied = False
+        self._action = 'None'
+
+        rs = requests.Session()
+        r = rs.get(url)
+        r.raise_for_status()
+
+        # Get the basic info
+        root = ElementTree.fromstring(r.content)
+        self._name = dequote(root.find('name').text)
+        self._version_min = Version(dequote(root.find('version_min').text))
+        self._version_max = Version(dequote(root.find('version_max').text))
+        self._source = dequote(root.find('source').text)
+        self._comments = dequote(root.find('comments').text)
+
+        # Key for sorting
+        #  - Lower case for alnum fields.
+        #  - 9 digits for numeric fields.
+        self._key = ''
+        pos = 0
+        while pos < len(self._name):
+            # Skip non-alnum
+            if not self._name[pos].isalnum():
+                self._key += self._name[pos]
+                pos += 1
+                continue
+            end = pos
+            while end < len(self._name) and self._name[end].isalnum():
+                end += 1
+            field = self._name[pos:end]
+            pos = end
+            try:
+                i = int(field)
+                self._key += "%09d" % (i)
+            except ValueError:
+                self._key += field.lower()
+
+        self._patches = dict()
+        p_root = root.find('patch_list')
+        for p in p_root.findall('patch'):
+            ver = Version(dequote(p.attrib['version']))
+            url = dequote(p.text)
+            self._patches[ver] = Patch(url)
+
+    def applied(self, val = None):
+        if not val is None:
+            self._applied = val
+        return self._applied
+
+    def action(self, val = None):
+        if not val is None:
+            self._action = val
+        return self._action
+
+    def name(self):
+        return self._name
+
+    def version_min(self):
+        return self._version_min
+
+    def version_max(self):
+        return self._version_max
+
+    def source(self):
+        return self._source
+
+    def patches(self):
+        return self._patches
+
+    def process(self, ver):
+        patch = self.patches()[ver]
+        if patch.can_reverse():
+            self.applied(True)
+            self.action('Already applied')
+            return
+        if patch.in_git_history():
+            self.applied(True)
+            self.action('In git history')
+            return
+        if cfg['dry-run']:
+            if patch.can_apply():
+                self.applied(True)
+                self.action('Can apply')
+            else:
+                self.applied(False)
+                self.action('Cannot apply')
+            return
+        if patch.can_apply():
+            try:
+                patch.git_am()
+                self.applied(True)
+                self.action('Applied cleanly')
+                return
+            except RuntimeError:
+                if cfg['ni']:
+                    self.applied(False)
+                    self.action('Skipped')
+                    return
+                sys.stdout.write(" Failed, patching manually ...\n")
+                patch.apply()
+                reply = raw_input("  Please verify and press enter to continue...")
+                argv = ['git', 'add']
+                argv.extend(patch.files())
+                (rc, out, err) = cmd_run(argv)
+                if rc != 0:
+                    # Should never happen
+                    print "  *** Failed to add git files"
+                    reply = raw_input("  Please add/remove files and press enter: ")
+                argv = ['git', 'am', '--continue']
+                (rc, out, err) = cmd_run(argv)
+                if rc != 0:
+                    # Should never happen
+                    print "  *** Failed to continue merge"
+                    reply = raw_input("  Please complete merge and press enter: ")
+                sys.stdout.write("  ")
+                self.applied(True)
+                self.action('Applied manually')
+                return
+        self.applied(False)
+        self.action('Cannot apply')
 
 def get_kernel_version():
     f = open("Makefile")
@@ -168,96 +307,144 @@ def get_kernel_version():
     f.close()
     return Version("%d.%d" % (v_major, v_minor))
 
+def get_git_history():
+    sys.stdout.write("Reading git history: ")
+    sys.stdout.flush()
+    argv = ['git', 'log', '--oneline', '--no-merges']
+    child = subprocess.Popen(argv, stdin=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    lines = 0
+    for line in child.stdout:
+        (sha, subject) = line.split(' ', 1)
+        git_history[subject.strip()] = sha
+        lines += 1
+        if (lines % 1000) == 0:
+            sys.stdout.write('.')
+            sys.stdout.flush()
+    sys.stdout.write('\n')
+    sys.stdout.flush()
+    child.wait()
+    if child.returncode != 0:
+        raise RuntimeError("Failed to read git history")
+
 def get_vuln_list():
     vuln_list = []
     rs = requests.Session()
-    print "Fetching vuln list"
-    vl_r = rs.get("http://code.nwwn.com/vuln/vuln_list.php?format=xml&off=0&len=1000")
+    sys.stdout.write("Fetching vuln list: ")
+    sys.stdout.flush()
+    vl_r = rs.get("http://code.nwwn.com/vuln/vuln_list.php?format=xml")
     vl_r.raise_for_status()
     vl_root = ElementTree.fromstring(vl_r.text)
+    count = 0
     for vl_elem in vl_root:
-        vuln = dict()
         id = dequote(vl_elem.attrib['id'])
-        v_r = rs.get("http://code.nwwn.com/vuln/vuln_detail.php?format=xml&id=%s" % (id))
-        v_root = ElementTree.fromstring(v_r.text)
-        vuln['name'] = dequote(v_root.find('name').text)
-        vuln['version_min'] = Version(dequote(v_root.find('version_min').text))
-        vuln['version_max'] = Version(dequote(v_root.find('version_max').text))
-        vuln['comments'] = dequote(v_root.find('comments').text)
-
-        vuln['patches'] = dict()
-        p_root = v_root.find('patch_list')
-        for p in p_root.findall('patch'):
-            ver = Version(dequote(p.attrib['version']))
-            url = dequote(p.text)
-            vuln['patches'][ver] = url
-        print "Vuln id=%s name=%s v_min=%s v_max=%s has %d patches" % (id,
-                vuln['name'], vuln['version_min'], vuln['version_max'],
-                len(vuln['patches']))
+        vuln = Vuln("http://code.nwwn.com/vuln/vuln_detail.php?format=xml&id=%s" % (id))
         vuln_list.append(vuln)
-    return vuln_list
+        count += 1
+        if (count % 10) == 0:
+            sys.stdout.write('.')
+            sys.stdout.flush()
+    sys.stdout.write('\n')
+    sys.stdout.flush()
+    return sorted(vuln_list, key = lambda x:x._key)
 
-def find_best_patch_url(kver, vuln):
-    patches = vuln['patches']
-    if len(patches) == 0:
-        return ''
-    if kver in patches:
-        return patches[kver]
-    for v in patches:
-        return patches[v]
+# Process a vuln and update status.
+def process_vuln(vuln, ver):
+    return
 
-cfg = dict()
-cfg['dry-run'] = False
+### Begin main code ###
 
-optargs, argv = getopt.getopt(sys.argv[1:], 'n', ['dry-run'])
+if not sys.stdin.isatty():
+    cfg['ni'] = True
+
+optargs, argv = getopt.getopt(sys.argv[1:], '', ['dry-run', 'interactive', 'non-interactive'])
 for k, v in optargs:
-    if k in ('-n', '--dry-run'):
+    if k in ('--dry-run'):
         cfg['dry-run'] = True
+    if k in ('--interactive'):
+        cfg['ni'] = False
+    if k in ('--non-interactive'):
+        cfg['ni'] = True
 
 kver = get_kernel_version()
+
+ksources = set()
+ksources.add('mainline')
+if os.path.exists('drivers/staging/android'):
+    ksources.add('android')
+if os.path.exists('arch/arm/mach-msm'):
+    ksources.add('caf')
+# XXX: mtk?
+if os.path.exists('drivers/staging/prima'):
+    ksources.add('prima')
+if os.path.exists('drivers/staging/qcacld-2.0'):
+    ksources.add('qcacld')
+# ...
+
+get_git_history()
 vuln_list = get_vuln_list()
 
 for vuln in vuln_list:
-    name = vuln['name']
-    vmin = vuln['version_min']
-    vmax = vuln['version_max']
+    sys.stdout.write("Processing %s" % (vuln.name()))
+    vmin = vuln.version_min()
+    vmax = vuln.version_max()
+
     if not kver.in_range(vmin, vmax):
-        print "Vuln %s does not apply: %s not in [%s,%s]" % (name, kver, vmin, vmax)
+        sys.stdout.write(" ... Not applicable: %s not in [%s,%s]\n" % (kver, vmin, vmax))
         continue
-    patch_url = find_best_patch_url(kver, vuln)
-    if not patch_url:
-        print "Vuln %s has no patches" % (name)
+
+    if vuln.source():
+        if not vuln.source() in ksources:
+            sys.stdout.write(" ... Not applicable: source %s not found\n" % (vuln.source()))
+            continue
+
+    patches = vuln.patches()
+    if len(patches) == 0:
+        sys.stdout.write(" No patches\n")
         continue
-    patch = Patch.from_url(patch_url)
-    if patch.can_reverse():
-        print "Vuln %s is patched" % (name)
-        continue
-    if patch.in_git_history():
-        print "Vuln %s in git history" % (name)
-        continue
-    if cfg['dry-run']:
-        if patch.can_apply():
-            print "Vuln %s can apply" % (name)
-        else:
-            print "Vuln %s cannot apply" % (name)
-        continue
-    if patch.can_apply():
-        try:
-            patch.git_am()
-            print "Vuln %s patched successfully" % (name)
-        except RuntimeError:
-            print "Vuln %s failed to merge, patching manually..." % (name)
-            patch.apply()
-            reply = raw_input("  Please verify and press enter to continue...")
-            argv = ['git', 'add']
-            argv.extend(patch.files())
-            (rc, out, err) = cmd_run(argv)
-            if rc != 0:
-                raise RuntimeError("Failed to git add files")
-            argv = ['git', 'am', '--continue']
-            (rc, out, err) = cmd_run(argv)
-            if rc != 0:
-                raise RuntimeError("Failed to continue merge")
+
+    if kver in patches:
+        vuln.process(kver)
+        sys.stdout.write(" ... %s" % (vuln.action()))
     else:
-        print "Vuln %s cannot apply" % (name)
-        reply = raw_input("  Please apply and press enter to continue...")
+        if not vuln.applied():
+            # Try forward port
+            pver = None
+            for k in patches:
+                if not k < kver:
+                    continue
+                if not pver or k > pver:
+                    pver = k
+            if pver:
+                sys.stdout.write(" ... Try %s" % (pver))
+                vuln.process(pver)
+                sys.stdout.write(" ... %s" % (vuln.action()))
+
+        if not vuln.applied():
+            # Try backward port
+            pver = ''
+            patch = None
+            for k in patches:
+                if not k > kver:
+                    continue
+                if not pver or k < pver:
+                    pver = k
+            if pver:
+                sys.stdout.write(" ... Try %s" % (pver))
+                vuln.process(pver)
+                sys.stdout.write(" ... %s" % (vuln.action()))
+
+    if vuln.applied():
+        sys.stdout.write('\n')
+    else:
+        sys.stdout.write(" ... Paches:\n")
+        for k in patches:
+            sys.stdout.write("  %s: %s\n" % (k, patches[k].url()))
+        reply = ''
+        if cfg['ni']:
+            reply = 's'
+        while reply != 'a' and reply != 's':
+            reply = raw_input("  Please apply manually. [S]kip or [A]pplied: ")
+            if len(reply) > 0:
+                reply = reply[0].lower()
+            else:
+                reply = 's'
