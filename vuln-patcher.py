@@ -3,8 +3,10 @@
 import os
 import sys
 import requests
+import base64
 import getopt
 from xml.etree import ElementTree
+import email
 import subprocess
 
 cfg = dict()
@@ -25,6 +27,17 @@ def cmd_run(args, stdin=None):
     (out, err) = child.communicate()
     rc = child.returncode
     return (rc, out.rstrip('\n').split('\n'), err.rstrip('\n').split('\n'))
+
+def get_input(s):
+    # https://rosettacode.org/wiki/Keyboard_input/Flush_the_keyboard_buffer#Python
+    try:
+        import msvcrt
+        while msvcrt.kbhit():
+            msvcrt.getch()
+    except ImportError:
+        import termios    #for linux/unix
+        termios.tcflush(sys.stdin, termios.TCIOFLUSH)
+    return raw_input(s)
 
 class Version:
     def __init__(self, ver):
@@ -92,20 +105,24 @@ class Patch:
         rs = requests.Session()
         r = rs.get(self._url)
         r.raise_for_status()
-        self._text = r.content
-        for line in self._text.rstrip('\n').split('\n'):
-            fields = line.split(' ', 1)
-            if len(fields) < 2:
-                continue
-            if fields[0] == 'From':
-                self._sha = fields[1]
-            if fields[0] == 'From:':
-                self._author = fields[1]
-            if fields[0] == 'Date:':
-                self._date = fields[1]
-            if fields[0] == 'Subject:':
-                self._subject = fields[1].strip()
-            if fields[0] == 'diff':
+        if r.content.startswith('From '):
+            self._text = r.content
+        else:
+            self._text = base64.b64decode(r.content)
+
+        message = email.message_from_string(self._text)
+        s = message.get_unixfrom()
+        if not s:
+            return
+        self._sha = s.split(' ', 2)[1]
+        self._author = message['From']
+        self._date = message['Date']
+        self._subject = message['Subject']
+        self._subject = self._subject.replace('\n', '')
+
+        s = message.get_payload(decode=True)
+        for line in s.rstrip('\n').split('\n'):
+            if line.startswith('diff '):
                 fields = line.split(' ')
                 self._files.append(fields[2][2:])
 
@@ -271,20 +288,20 @@ class Vuln:
                     return
                 sys.stdout.write(" Failed, patching manually ...\n")
                 patch.apply()
-                reply = raw_input("  Please verify and press enter to continue...")
+                reply = get_input("  Please verify and press enter to continue...")
                 argv = ['git', 'add']
                 argv.extend(patch.files())
                 (rc, out, err) = cmd_run(argv)
                 if rc != 0:
                     # Should never happen
                     print "  *** Failed to add git files"
-                    reply = raw_input("  Please add/remove files and press enter: ")
+                    reply = get_input("  Please add/remove files and press enter: ")
                 argv = ['git', 'am', '--continue']
                 (rc, out, err) = cmd_run(argv)
                 if rc != 0:
                     # Should never happen
                     print "  *** Failed to continue merge"
-                    reply = raw_input("  Please complete merge and press enter: ")
+                    reply = get_input("  Please complete merge and press enter: ")
                 sys.stdout.write("  ")
                 self.applied(True)
                 self.action('Applied manually')
@@ -347,10 +364,6 @@ def get_vuln_list():
     sys.stdout.flush()
     return sorted(vuln_list, key = lambda x:x._key)
 
-# Process a vuln and update status.
-def process_vuln(vuln, ver):
-    return
-
 ### Begin main code ###
 
 if not sys.stdin.isatty():
@@ -371,13 +384,16 @@ ksources = set()
 ksources.add('mainline')
 if os.path.exists('drivers/staging/android'):
     ksources.add('android')
-if os.path.exists('arch/arm/mach-msm'):
+if os.path.exists('drivers/misc/qcom'):
     ksources.add('caf')
-# XXX: mtk?
+if os.path.exists('drivers/misk/mediatek'):
+    ksources.add('mtk')
 if os.path.exists('drivers/staging/prima'):
     ksources.add('prima')
 if os.path.exists('drivers/staging/qcacld-2.0'):
     ksources.add('qcacld')
+if os.path.exists('drivers/net/wireless/bcmdhd'):
+    ksources.add('bcmdhd')
 # ...
 
 get_git_history()
@@ -438,12 +454,13 @@ for vuln in vuln_list:
     else:
         sys.stdout.write(" ... Paches:\n")
         for k in patches:
-            sys.stdout.write("  %s: %s\n" % (k, patches[k].url()))
+            sys.stdout.write("  %s: %s\n" % (k, patches[k].subject()))
+            sys.stdout.write("    %s\n" % (patches[k].url()))
         reply = ''
         if cfg['ni']:
             reply = 's'
         while reply != 'a' and reply != 's':
-            reply = raw_input("  Please apply manually. [S]kip or [A]pplied: ")
+            reply = get_input("  Please apply manually. [S]kip or [A]pplied: ")
             if len(reply) > 0:
                 reply = reply[0].lower()
             else:
