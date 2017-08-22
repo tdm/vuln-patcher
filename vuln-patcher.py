@@ -394,6 +394,16 @@ if os.path.exists('drivers/staging/qcacld-2.0'):
     ksources.add('qcacld')
 if os.path.exists('drivers/net/wireless/bcmdhd'):
     ksources.add('bcmdhd')
+if os.path.exists('drivers/input/touchscreen/synaptics_dsx'):
+    ksources.add('synaptics_dsx')
+if os.path.exists('drivers/input/misc/vl6180'):
+    ksources.add('vl6180')
+if os.path.exists('drivers/input/misc/vl53L0'):
+    ksources.add('vl53L0')
+if os.path.exists('sound/soc/codecs/rt5506.h'):
+    ksources.add('rt5506')
+if os.path.exists('sound/soc/codecs/rt5677.h'):
+    ksources.add('rt5677')
 # ...
 
 get_git_history()
